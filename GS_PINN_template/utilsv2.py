@@ -150,7 +150,7 @@ import configv2 as config
 #     psi_H = c1 * psi1 + c2 * psi2 + c3 * psi3 + c4 * psi4 + c5 * psi5 + c6 * psi6 + c7 * psi7
 #     return psi_P + psi_H
 
-def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y): #to be integrated into helena later 
+def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y, data_train_all, task): #to be integrated into helena later 
     """
     Generate training data (coordinates, labels, and source term) for a given task.
     
@@ -177,8 +177,8 @@ def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y): #to be integrated int
     Z_data = eq["Z"]
     psi_data = eq["psi"]
     print(R_data.shape, Z_data.shape, psi_data.shape)
-    cs = plt.pcolormesh(R_data[:], Z_data[:], psi_data[:])
-    plt.colorbar(cs)
+    # cs = plt.pcolormesh(R_data[:], Z_data[:], psi_data[:])
+    # plt.colorbar(cs)
 
     # lcfs_path = cs.collections[0].get_paths()[0]
     # lcfs_vertices = lcfs_path.vertices
@@ -198,13 +198,16 @@ def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y): #to be integrated int
     x_eq = R_eq
     y_eq = Z_eq
     
-    # Define PINN training grid (in x,y)
-    Nx, Ny = n_x, n_y
-    x_lin = np.linspace(x_eq.min(), x_eq.max(), Nx)
-    y_lin = np.linspace(y_eq.min(), y_eq.max(), Ny)
-    xg, yg = np.meshgrid(x_lin, y_lin, indexing="xy")
+    # # Define PINN training grid (in x,y)
+    # Nx, Ny = n_x, n_y
+    # x_lin = np.linspace(x_eq.min(), x_eq.max(), Nx)
+    # y_lin = np.linspace(y_eq.min(), y_eq.max(), Ny)
+    # xg, yg = np.meshgrid(x_lin, y_lin, indexing="xy")
 
-    data_train = np.column_stack([xg.ravel(), yg.ravel()])
+    # data_train = np.column_stack([xg.ravel(), yg.ravel()])
+    
+    reference_inputs = data_train_all[task]
+
     
     # HELENA already uses normalized psī = ψ / ψ_boundary
     psi_bar_eq = psi_eq[::, None]#[:: -1, None]
@@ -213,7 +216,7 @@ def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y): #to be integrated int
     psi_grid = griddata(
         points=np.column_stack([x_eq, y_eq]),
         values=psi_bar_eq.ravel(),
-        xi=data_train,
+        xi=reference_inputs,
         method="cubic"
     )[:, None]
     
@@ -224,7 +227,7 @@ def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y): #to be integrated int
 
     # Remove NaNs (outside LCFS)
     mask = ~np.isnan(labels[:, 0])
-    data_train = data_train[mask]
+    data_train = reference_inputs
     labels = labels[mask]
     
     #extract constant terms in p' and ff' expressions to place in rhs source. 
@@ -687,11 +690,11 @@ def eval_inverse_loss(params_inv, label_train_all, task, model, fixed_params, i_
     
     
     #non-constant terms in u #change depending on p' and ff' profiles, consider placing in config?
-    def nonlin(z):
-        return 0
+    def nonlinff(z):
+        return config.A_helena * z
     
     # PDE residual
-    pde = u_xx - (config.epsilon / (1.0 + config.epsilon * x)) * u_x + u_yy + nonlin(u) #- rhs
+    pde = u_xx - (config.epsilon / (1.0 + config.epsilon * x)) * u_x + u_yy + nonlinff(u) #- rhs
     #pde = u_xx - (config.epsilon / (1.0 + config.epsilon * x)) * u_x + u_yy # linear solovev case 
 
     # Use regularization scalars from trained model
