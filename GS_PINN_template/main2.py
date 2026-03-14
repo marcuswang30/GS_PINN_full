@@ -1,36 +1,11 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Dec  8 13:30:51 2025
-
-@author: marcu
-"""
-
-"""
-Main script for meta-training the raw PINN for the Gradâ€“Shafranov equation
-by varying different parameters, while keeping the rest fixed.
-Then, the trained model is evaluated on all tasks:
-- The linear system is solved using regularised pseudo-inverse.
-- Metrics (MSE, SSR, relative L2 error) for each task are saved to a CSV.
-- For each task, a 2x2 plot is generated showing the analytical solution,
-  predicted solution, MSE contour, and an MSE slice at Z=0.
-"""
-
 import time
+import jax
+import jax.numpy as jnp
 import optax
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
-
-os.environ["JAX_ENABLE_X64"] = "1"                
-os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"  
-
-from jax import config as jax_config
-jax_config.update("jax_enable_x64", True)
-jax_config.update("jax_default_matmul_precision", "highest")
-
-import jax
-import jax.numpy as jnp
 
 from flax import linen as nn
 from jax.scipy.linalg import solve
@@ -44,39 +19,38 @@ import config
 # ---------------------
 seed = config.seed
 key = jax.random.PRNGKey(seed)
-trial = config.trial
+trial = 'iPINN_08'
 print("JAX devices:", jax.devices())
 print("Default backend:", jax.default_backend())
 
 # ---------------------
-# Build task parameters: Vary certain params, keep the other fixed
+# Build task parameters: Vary both delta and P
 # ---------------------
-# ---------------------
-# Training for P
-# ---------------------
-fixed_delta = config.delta_vals  
-P_vals = config.P_vals
-task_params = P_vals.reshape(-1, 1)  # Shape: (n_task, 1)
-# ---------------------
-# Training for delta
-# ---------------------
-# delta_vals = config.delta_vals
-# fixed_P = config.P_vals         
-# task_params = delta_vals.reshape(-1, 1)  # Shape: (n_task, 1)
+# Use all delta values from config.delta_vals and generate a range for P.
+# (Here we generate a 1D array for P. Adjust the number of P samples as needed.)
+delta_vals = config.delta_vals                   # shape: (n_delta,)
+P_vals = config.P_vals           # pressure profile parameter range (excluding zero)
 
-fixed_kappa = config.kappa_vals    
-n_task = len(task_params)
+# Create a grid (Cartesian product) of [delta, P] values.
+delta_grid, P_grid = jnp.meshgrid(delta_vals, P_vals)
+task_params = jnp.stack([delta_grid.ravel(), P_grid.ravel()], axis=-1)  # each row is [delta, P]
+n_task = task_params.shape[0]
 print("Number of tasks:", n_task)
 config.n_train_tasks = n_task
 
+print("delta_vals shape:", delta_vals.shape)
+print("P_vals shape:", P_vals.shape)
+print("Task parameters shape:", task_params.shape)
+print("Sample task parameters (first 5):", task_params[:5])
 # ---------------------
 # Generate training data for each task
 # ---------------------
-# Change delta & P according to your task
 data_train_list, label_train_list, source_term_list = [], [], []
-for P_val in task_params:
+for i in range(n_task):
+    delta_val = task_params[i, 0]
+    P_val = task_params[i, 1]
     data_train, labels, g, i_bc = utils.generate_data(
-        config.epsilon, fixed_kappa, fixed_delta, P_val.item(),
+        config.epsilon, config.kappa_vals, delta_val.item(), P_val.item(),
         config.n_train_radial, config.n_train_angular
     )
     data_train_list.append(data_train)
@@ -87,14 +61,17 @@ data_train_all = jnp.array(data_train_list)
 label_train_all = jnp.array(label_train_list)
 source_term_all = jnp.array(source_term_list)
 
+print("data_train_all shape:", data_train_all.shape)
+print("label_train_all shape:", label_train_all.shape)
+print("source_term_all shape:", source_term_all.shape)
 # ---------------------
 # Define boundary condition indicator (assumed same for all tasks)
 # ---------------------
-radial = jnp.linspace(0, config.epsilon, config.n_train_radial)
-angular = jnp.linspace(0, 2*jnp.pi, config.n_train_angular)
-radial_mesh, _ = jnp.meshgrid(radial, angular, indexing="xy")
-i_bc = (radial_mesh.ravel() == config.epsilon)         
-print(i_bc.shape, jnp.sum(i_bc))
+_, angular_mesh = jnp.meshgrid(
+    jnp.linspace(0, config.epsilon, config.n_train_radial),
+    jnp.linspace(0, 2 * jnp.pi, config.n_train_angular)
+)
+i_bc = jnp.where(angular_mesh.ravel() == config.epsilon, 1, 0)
 
 # ---------------------
 # Initialize the PINN model
@@ -109,14 +86,14 @@ key, subkey = jax.random.split(key)
 extra_params = jax.random.normal(subkey, [2])
 params_flat = jnp.append(params_flat, extra_params)
 
-# Parameter formatting 
+# Create a parameter formatting function
 def format_params_fn(p):
     base_params = p[:-2]
     return unravel_fn(base_params)
 
 # Comment from here if you just want to run inverse
 # ---------------------
-# Set up the optimizer
+# Set up the optimizer for meta-training
 # ---------------------
 lr_scheduler = optax.warmup_cosine_decay_schedule(
     init_value=config.max_lr,
@@ -132,6 +109,7 @@ opt_state = optimizer.init(params_flat)
 # Loss function for meta-learning (raw PINN component)
 # ---------------------
 def eval_loss(params_flat, task):
+    # Get the training data for this task.
     inputs = data_train_all[task]
     labels = label_train_all[task]
     g = source_term_all[task]
@@ -149,7 +127,7 @@ def eval_loss(params_flat, task):
     A = jnp.vstack([pde * lmbda, u[i_bc]])
     b = jnp.vstack([g * lmbda, labels[i_bc]])
     
-    # Regularized pseudo-inverse
+    # Use regularized pseudo-inverse (ridge solve).
     As = lamb * jnp.eye(A.shape[1]) + (A.T @ A)
     bs = A.T @ b
     w = solve(As, bs)
@@ -163,51 +141,40 @@ def eval_loss(params_flat, task):
     pde_loss = jnp.mean((pde * lmbda - g * lmbda)**2)
     bc_loss = jnp.mean((u[i_bc] - labels[i_bc])**2)
     
-    loss = mse  
+    loss = mse  # the training loss is defined as MSE.
     return loss, (ssr, mse, rl2, pde_loss, bc_loss, lamb, lmbda)
 
 loss_grad = jax.jit(jax.value_and_grad(eval_loss, has_aux=True))
 
 # ---------------------
-# Mini-batch update function over meta-training tasks
+# Vectorized mini-batch update function over meta-training tasks using jax.vmap
 # ---------------------
 @jax.jit
 def update(params_flat, opt_state, key):
-    # r_task = min(8, config.n_meta_train)
     r_task = config.n_meta_train
-    train_tasks = jax.random.choice(key, jnp.arange(n_task), (r_task,), replace=False)
-    losses = 0.0
-    ssrs = 0.0
-    mses = 0.0
-    rl2s = 0.0
-    pde_losses = 0.0
-    bc_losses = 0.0
-    lambs = 0.0
-    lmbdas = 0.0
-    grads = 0.0
-    for task in train_tasks:
-        (loss, (ssr, mse, rl2, pde_loss, bc_loss, lamb_val, lmbda_val)), grad = loss_grad(params_flat, task)
-        grads += grad
-        losses += loss
-        ssrs += ssr
-        mses += mse
-        rl2s += rl2
-        pde_losses += pde_loss
-        bc_losses += bc_loss
-        lambs += lamb_val
-        lmbdas += lmbda_val
-    losses /= r_task
-    ssrs /= r_task
-    mses /= r_task
-    rl2s /= r_task
-    pde_losses /= r_task
-    bc_losses /= r_task
-    lambs /= r_task
-    lmbdas /= r_task
-    grads /= r_task
-    updates, opt_state = optimizer.update(grads, opt_state)
+    # Sample a batch of task indices.
+    tasks_batch = jax.random.choice(key, jnp.arange(n_task), shape=(r_task,), replace=False)
+    
+    # Define a function for loss and gradient per task.
+    def loss_and_grad_fn(task):
+        return loss_grad(params_flat, task)
+    
+    # Vectorize the computation over the batch.
+    batched_out = jax.vmap(loss_and_grad_fn)(tasks_batch)
+    # batched_out is a tuple: ( (losses, aux_metrics), grads )
+    # Extract losses and aux metrics.
+    losses_array = batched_out[0][0]  # shape: (r_task,)
+    aux_metrics = batched_out[0][1]   # each is an array of shape (r_task,)
+    # Average aux metrics.
+    avg_aux = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), aux_metrics)
+    avg_loss = jnp.mean(losses_array)
+    
+    # Average gradients over tasks.
+    avg_grad = jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0), batched_out[1])
+    
+    updates, opt_state = optimizer.update(avg_grad, opt_state)
     params_flat = optax.apply_updates(params_flat, updates)
-    return params_flat, opt_state, losses, ssrs, mses, rl2s, pde_losses, bc_losses, lambs, lmbdas
+    return params_flat, opt_state, avg_loss, avg_aux
 
 # ---------------------
 # Training loop for meta-learning
@@ -221,12 +188,14 @@ train_iters = 0
 store = []
 start_time = time.time()
 
-while (train_iters <= config.max_iters) and (runtime < 9000):
+while (train_iters <= config.max_iters) and (runtime < 12000):
     print(f"iter: {train_iters}")
     key, subkey = jax.random.split(key)
-    (params_flat, opt_state, loss, ssr, mse, rl2, pde_loss, bc_loss, lamb_val, lmbda_val) = update(params_flat, opt_state, subkey)
+    (params_flat, opt_state, loss, aux) = update(params_flat, opt_state, subkey)
     train_iters += 1
     runtime = time.time() - start_time
+    # Unpack auxiliary metrics.
+    ssr, mse, rl2, pde_loss, bc_loss, lamb_val, lmbda_val = aux
     store.append([train_iters, runtime, loss, ssr, mse, rl2, pde_loss, bc_loss, lamb_val, lmbda_val])
     
     training_iters.append(train_iters)
@@ -250,46 +219,52 @@ plt.legend()
 plt.savefig(f"../results/{trial}/training_losses.png")
 # plt.show()
 
-# Save model
+# ---------------------
+# Evaluation: For each task, use a pseudo-inverse to solve the linear system,
+# save metrics to CSV, and produce plots.
+# ---------------------
+eval_results = []  
+for task in range(n_task):
+    # Here we pass the true parameters for the task from task_params.
+    result = utils.evaluate_task(
+        task, data_train_all, label_train_all, source_term_all, i_bc,
+        model, params_flat, format_params_fn, config
+    )
+    # Overwrite the task parameters in the result with the true ones.
+    result['delta'] = float(task_params[task, 0])
+    result['P'] = float(task_params[task, 1])
+    
+    print(f"Task {task}: True delta = {result['delta']:.4f}, True P = {result['P']:.4f}, MSE = {result['mse']:.4e}")
+    eval_results.append(result)
+    utils.plot_evaluation(
+        task, data_train_all, label_train_all, result, config,
+        save_path=f"../results/{trial}/task_{task:02d}_plot.png"
+    )
+
+df = pd.DataFrame(eval_results)
+df.to_csv(f"../results/{trial}/task_metrics.csv", index=False)
+
+print(f"Final regularization parameters: lamb = {result['lamb']:.2e}, lmbda = {result['lmbda']:.2e}")
+
+# ---------------------
+# Save the meta model parameters after meta training
+# ---------------------
 os.makedirs(f"../model/{trial}", exist_ok=True)
 meta_model_file = f"../model/{trial}/meta_model.flax"
 utils.save_meta_model(params_flat, meta_model_file)
 
 
 # ---------------------
-# Evaluation: For each task, use a pseudo-inverse to solve the linear system,
-# save metrics to CSV, and produce plots.
-# ---------------------
-meta_model_file = f"../model/{trial}/meta_model.flax"
-target = jnp.zeros_like(params_flat)
-params_flat = utils.load_meta_model(meta_model_file, target)
-eval_results = []  
-for task in range(n_task):
-    result = utils.evaluate_task(
-        task, data_train_all, label_train_all, source_term_all, i_bc,
-        model, params_flat, format_params_fn, config
-    )
-    eval_results.append(result)
-    utils.plot_evaluation(
-        task, data_train_all, label_train_all, result, config,
-        save_path=f"../results/{trial}/task_{task:02d}_plot.png",
-    )
-
-df = pd.DataFrame(eval_results)
-df.to_csv(f"../results/{trial}/task_metrics.csv", index=False)
-
-# print(f"Final regularization parameters: lamb = {result['lamb']:.2e}, lmbda = {result['lmbda']:.2e}")
-
-
-# ---------------------
-# Inverse Training: Infer P/ delta for each task
+# Inverse Training: Infer P and delta for each task
 # ---------------------
 print("Starting inverse training...")
 
+# Load the saved meta model parameters using Flax serialization.
 target = jnp.zeros_like(params_flat)
 params_flat = utils.load_meta_model(meta_model_file, target)
 print("Meta model loaded for inverse training.")
 
+# Set up inverse optimizer using inverse hyperparameters from config
 inverse_lr_scheduler = optax.warmup_cosine_decay_schedule(
     init_value=config.inverse_max_lr,
     peak_value=config.inverse_max_lr,
@@ -299,24 +274,25 @@ inverse_lr_scheduler = optax.warmup_cosine_decay_schedule(
 )
 inverse_optimizer = optax.adam(learning_rate=inverse_lr_scheduler)
 
-inverse_results = [] 
+# For each task, run an inverse training loop.
+inverse_results = []  # to store inferred parameters and losses
 
 for task in range(n_task):
     print(f"\nInverse training for task {task}...")
-    # Initialize inverse parameters randomly (shape (2,))
+    # Initialize inverse parameters randomly (shape (2,)): params_inv[0] for P and params_inv[1] for delta.
     key, subkey = jax.random.split(key)
-    params_inv = jax.random.normal(subkey, (1,))
+    params_inv = jax.random.normal(subkey, (2,))
     opt_state_inv = inverse_optimizer.init(params_inv)
-
+    
+    # Prepare fixed_params dictionary for inverse loss.
     fixed_params = {
-        'inputs': jnp.array(data_train_all[task]), 
-        'forward': format_params_fn(params_flat),     
-        'params_flat': params_flat                     
+        'inputs': jnp.array(data_train_all[task]),  # training data inputs for this task
+        'forward': format_params_fn(params_flat),     # fixed forward network parameters
+        'params_flat': params_flat                     # original forward flat parameters (for lmbda and lamb)
     }
     
     # Inverse training loop.
     inv_train_iters = 0
-    log = []
     while inv_train_iters < config.inverse_max_iters:
         params_inv, opt_state_inv, inv_loss, aux = utils.update_inverse(
             params_inv, opt_state_inv, task, model, fixed_params, i_bc, inverse_optimizer
@@ -324,64 +300,21 @@ for task in range(n_task):
         if inv_train_iters % 50 == 0:
             ssr, mse_val, rl2_val = aux
             print(f"Task {task:02d} iter {inv_train_iters:03d}: inverse loss = {inv_loss:.2e}, mse = {mse_val:.2e}")
-        
-        # ---------------------
-        # Training for P
-        # ---------------------
-        P_infer = float(0.8 + 0.2 * nn.sigmoid(params_inv[0]))
-
-        # ---------------------
-        # Training for delta
-        # ---------------------
-        # delta_infer = float(0.2 + 0.5 * nn.sigmoid(params_inv[0]))  ### CHANGE
-
-        log.append([inv_train_iters, float(inv_loss), float(ssr), float(mse_val), float(P_infer)])
         inv_train_iters += 1
         
-    # After training, store the final inferred values.
-    
-    # ---------------------
-    # Training for delta
-    # ---------------------
-    # P_infer_final = float(config.P_vals)
-    # delta_infer_final = delta_infer
-        
-    # ---------------------
-    # Training for P
-    # ---------------------
-    P_infer_final = P_infer
-    delta_infer_final = float(config.delta_vals)
-
+    # After training, compute the final inferred values.
+    P_infer_final = float(nn.sigmoid(params_inv[0]))          # Map raw value to (0,1)
+    delta_infer_final = float(0.3 + 0.2 * nn.sigmoid(params_inv[1]))  ### CHANGE
     inverse_results.append({
         'task': task,
-        # ---------------------
-        # Training for P
-        # ---------------------
-        'true_P': float(config.P_vals[task]),
+        'true_delta': float(task_params[task, 0]),
+        'inferred_delta': delta_infer_final,
+        'true_P': float(task_params[task, 1]),
         'inferred_P': P_infer_final,
-
-        # ---------------------
-        # Training for delta
-        # ---------------------
-        # 'true_delta': float(config.delta_vals[task]),
-        # 'inferred_delta': delta_infer_final,
-
         'inverse_loss': float(inv_loss)
     })
-    # ---------------------
-    # Training for delta
-    # ---------------------
-    # print(f"Task {task:02d}: True delta = {config.delta_vals[task]:.6f}, Inferred delta = {delta_infer_final:.6f}, Loss = {inv_loss:.2e}")
 
-    # ---------------------
-    # Training for P
-    # ---------------------
-    print(f"Task {task:02d}: True P = {config.P_vals[task]:.6f}, Inferred P = {P_infer_final:.6f}, Loss = {inv_loss:.2e}")
-
-    log = np.array(log)
-    np.savetxt(f"../results/{trial}/inverse_task_{task:02d}_log.txt", log)
-
-
+# Print inverse results:
 df_inv = pd.DataFrame(inverse_results)
 print("Inverse training results:")
 print(df_inv)
