@@ -150,6 +150,156 @@ import configv2 as config
 #     psi_H = c1 * psi1 + c2 * psi2 + c3 * psi3 + c4 * psi4 + c5 * psi5 + c6 * psi6 + c7 * psi7
 #     return psi_P + psi_H
 
+def ana_sol(x, y): #analytical solution for helena solovev 
+    tau = config.delta_vals
+    eps = config.epsilon
+    E = config.kappa_vals
+    T_1 = (x - eps/2 * (1 - x**2))**2
+    T_2 = (1 - eps**2/4)*((1 + eps*x)**2)
+    T_3 = tau * x * (1 + eps * x / 2)
+    T_4 = (y**2)/(E**2)
+    psi =  T_1 + (T_2 + T_3)*(T_4)
+    return psi
+
+
+def hel_editor(hel, B_val):
+    hel.namelist['phys']['B'] =  B_val
+    hel.namelist['shape']['ias'] = 1
+    hel.namelist['profile']['aga'] = 0
+    hel.namelist['num']['nr'] = 51
+    hel.namelist['num']['np'] = 128
+    hel.namelist['num']['nrmap'] = 101
+    hel.namelist['num']['npmap'] = 128
+    hel.namelist['num']['nchi'] = 128
+    print(hel.namelist)
+    
+    hel.run()
+    
+    print(hel)
+    
+    eq_name = f"f_-1_p_-1_B_{B_val}.npy"
+    id = 30
+    for id in range(1, len(hel.s), 4):
+        plt.scatter(hel.rgrid[id, :], hel.zgrid[id, :])
+    
+        # Construct psi on the same grid
+        psi_grid = hel.s[::-1, None]**2 * np.ones_like(hel.rgrid)
+        
+        # Save everything
+        np.save(
+         eq_name, #change numbering when making changes
+        {
+            "R": hel.rgrid,
+            "Z": hel.zgrid,
+            "psi": psi_grid,
+            "s": hel.s
+        })
+         
+    import sys     
+    sys.path.append('/content/GS_PINN_full/GS_PINN_template')
+    # from GS_PINN_template import configv2 as config
+    # from GS_PINN_template import utilsv2 as utils
+        
+    print('config.A_helena:',config.A_helena)
+    
+    # redefine variables     
+    A_helena = hel.abc[0]
+    B_helena = hel.abc[1]
+    eq = np.load(f'C:/Users/marcu/Downloads/{eq_name}', allow_pickle=True).item()
+        
+    print('new config.A_helena:',config.A_helena, 'B value', B_val)
+    #print('new config.B_vals:',config.B_vals)
+    return eq, A_helena, B_helena    
+
+def training_data(eq, B, A):
+    R_data = eq["R"]
+    Z_data = eq["Z"]
+    psi_data = eq["psi"]
+    print(R_data.shape, Z_data.shape, psi_data.shape)
+    cs = plt.pcolormesh(R_data[:], Z_data[:], psi_data[:])
+    plt.colorbar(cs)
+
+    # lcfs_path = cs.collections[0].get_paths()[0]
+    # lcfs_vertices = lcfs_path.vertices
+    # plt.close()
+
+    R_lcfs = R_data[0]
+    Z_lcfs = Z_data[0]
+    plt.plot(R_lcfs, Z_lcfs, 'k-')
+    plt.show()
+
+    # from scipy.interpolate import splprep, splev
+
+    # tck, _ = splprep([R_lcfs, Z_lcfs], s=1e-5, per=True)
+    # u = np.linspace(0, 1, 400)   # number of BC points
+    # R_bc, Z_bc = splev(u, tck)
+
+    i_bc = np.column_stack([R_lcfs, Z_lcfs])
+    labels_bc = np.ones((len(R_lcfs), 1))
+
+
+
+    R_eq = R_data.ravel()
+    Z_eq = Z_data.ravel()
+    psi_eq = psi_data.ravel()
+    #psi_eq.reshape(100, 100)
+
+    #changing coordinate systems 
+    x_eq = R_eq
+    y_eq = Z_eq
+    print(x_eq.min())
+    print(x_eq.max())
+    print(y_eq.min())
+    print(y_eq.max())
+
+
+
+
+
+    # HELENA already uses normalized psī = ψ / ψ_boundary
+    psi_bar_eq = psi_eq[::, None]#[:: -1, None]
+
+    #Interpolate between coordinate systems 
+    from scipy.interpolate import griddata
+
+    # Define PINN training grid (in x,y)
+    Nx, Ny = config.n_train_x, config.n_train_y
+    x_lin = np.linspace(x_eq.min(), x_eq.max(), Nx)
+    y_lin = np.linspace(y_eq.min(), y_eq.max(), Ny)
+    xg, yg = np.meshgrid(x_lin, y_lin, indexing="xy")
+
+    data_train = np.column_stack([xg.ravel(), yg.ravel()])
+    # data_train.shape == (10000, 2)
+
+    # Interpolate HELENA ψ onto PINN grid
+    psi_grid = griddata(
+        points=np.column_stack([x_eq, y_eq]),
+        values=psi_bar_eq.ravel(),
+        xi=data_train,
+        method="cubic"
+    )[:, None]
+    #psi_grid.shape == (Ny, Nx)
+
+    # Flatten interpolation 
+    #inputs = np.stack([xg.flatten(), yg.flatten()], axis=1)
+    labels = psi_grid.reshape(-1,1) #psi_grid.flatten()
+
+
+    # Remove NaNs (outside LCFS)
+    mask = ~np.isnan(labels[:, 0])
+    data_train = data_train[mask]
+    labels = labels[mask]
+    
+    #extract constant terms in p' and ff' expressions to place in rhs source. 
+    pprime_const = config.pprime_const
+    ffprime_const = config.ffprime_const  #check whether it should be pinn u or raw psi
+    epsilon = config.epsilon
+    
+    g =  A * (ffprime_const + B*(1 + epsilon * data_train[:, 0:1])**2 * pprime_const)
+    
+    return data_train, labels, i_bc, g 
+
+
 def generate_data(eq, epsilon, kappa, delta, B, n_x, n_y, data_train_all, task): #to be integrated into helena later 
     """
     Generate training data (coordinates, labels, and source term) for a given task.
